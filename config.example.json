@@ -1,0 +1,29 @@
+{
+  "timezone": "Asia/Jakarta",
+  "schedule": {
+    "enabled": true,
+    "hour": 4,
+    "minute": 30,
+    "weekdays": ["monday", "tuesday", "wednesday", "thursday", "friday"],
+    "pollIntervalMs": 30000,
+    "runOnStart": false,
+    "dedupeAcrossRestarts": true
+  },
+  "execution": {
+    "headless": false,
+    "execute": true,
+    "closeBrowser": true,
+    "browserChannel": "chrome",
+    "accountDelayMs": 5000,
+    "accountLockTtlMs": 21600000,
+    "unlockAfterLock": false,
+    "unlockAllOnly": false
+  },
+  "locking": {
+    "minAmount": 5000,
+    "amountMode": "max",
+    "amountValue": 5000,
+    "amountMax": 0,
+    "unlockAllBeforeLock": true
+  }
+}

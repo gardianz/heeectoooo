@@ -1,0 +1,27 @@
+[
+  {
+    "name": "account-1",
+    "enabled": true,
+    "email": "your-email-1@gmail.com",
+    "password": "your-password",
+    "gmailAppPassword": "your gmail app password",
+    "profileName": "account-1",
+    "locking": {
+      "amountMode": "max",
+      "amountMax": 0
+    }
+  },
+  {
+    "name": "account-2",
+    "enabled": true,
+    "email": "your-email-2@gmail.com",
+    "password": "your-password",
+    "gmailAppPassword": "your gmail app password",
+    "profileName": "account-2",
+    "locking": {
+      "amountMode": "value",
+      "amountValue": 5000,
+      "amountMax": 15000
+    }
+  }
+]
