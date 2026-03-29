@@ -351,7 +351,16 @@ Catatan:
 
 - profile browser persisten disimpan di `.profile/`
 - kalau Chrome di VPS berbeda channel, sesuaikan `execution.browserChannel`
+- untuk VPS tanpa desktop/X server, set `execution.headless: true` atau jalankan dengan `xvfb-run`
 - bila mode headless bermasalah pada flow Privy/Supanova, gunakan headful + virtual display
+
+Contoh cepat di VPS:
+
+```bash
+npm start
+```
+
+Jika `config.json` masih `headless: false`, bot sekarang akan otomatis memaksa headless saat mendeteksi Linux tanpa `DISPLAY` atau `WAYLAND_DISPLAY`.
 
 ## Audit Singkat
 

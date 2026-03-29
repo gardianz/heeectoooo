@@ -1132,6 +1132,23 @@ function sanitizeFilePart(value) {
     .toLowerCase();
 }
 
+function hasDisplayServer() {
+  return Boolean(process.env.DISPLAY?.trim() || process.env.WAYLAND_DISPLAY?.trim());
+}
+
+function resolveHeadlessMode(config) {
+  if (Boolean(config.execution.headless)) {
+    return true;
+  }
+
+  if (process.platform === "linux" && !hasDisplayServer()) {
+    log("No DISPLAY/WAYLAND detected on Linux, forcing headless browser mode. Use xvfb-run if you need headed Chrome.");
+    return true;
+  }
+
+  return false;
+}
+
 function getAccountLockKey(account) {
   return sanitizeFilePart(account.profileName || account.name || "account");
 }
@@ -1237,7 +1254,7 @@ async function runAccountCycle(account, config) {
     password: account.password,
     gmailAppPassword: account.gmailAppPassword,
   };
-  const headless = Boolean(config.execution.headless);
+  const headless = resolveHeadlessMode(config);
   const executeActions = Boolean(config.execution.execute);
   const unlockAfterLock = Boolean(config.execution.unlockAfterLock);
   const unlockAllOnly = Boolean(config.execution.unlockAllOnly);
