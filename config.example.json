@@ -16,6 +16,9 @@
     "browserChannel": "chrome",
     "accountDelayMs": 5000,
     "accountLockTtlMs": 21600000,
+    "retryOnFailure": true,
+    "retryDelayMs": 900000,
+    "maxAttemptsPerCycle": 2,
     "unlockAfterLock": false,
     "unlockAllOnly": false
   },

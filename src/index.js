@@ -156,6 +156,11 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function formatDurationMinutes(ms) {
+  const minutes = Math.max(1, Math.round(Number(ms) / 60000));
+  return `${minutes} minute${minutes === 1 ? "" : "s"}`;
+}
+
 function defaultConfig() {
   return {
     timezone: "Asia/Jakarta",
@@ -175,6 +180,9 @@ function defaultConfig() {
       browserChannel: "chrome",
       accountDelayMs: 5_000,
       accountLockTtlMs: 6 * 60 * 60 * 1000,
+      retryOnFailure: true,
+      retryDelayMs: 15 * 60 * 1000,
+      maxAttemptsPerCycle: 2,
     },
     locking: {
       minAmount: 5_000,
@@ -1410,24 +1418,57 @@ async function runAccountsOnce(config, accounts) {
   log(`Starting cycle for ${accounts.length} account(s)`);
   for (let index = 0; index < accounts.length; index += 1) {
     const account = accounts[index];
-    const accountLock = await acquireAccountLock(account, config);
-    if (!accountLock.acquired) {
+    const retryOnFailure = config.execution.retryOnFailure !== false;
+    const retryDelayMs = Math.max(60_000, Number(config.execution.retryDelayMs ?? 15 * 60 * 1000));
+    const maxAttemptsPerCycle = Math.max(1, Number.parseInt(String(config.execution.maxAttemptsPerCycle ?? 2), 10) || 2);
+    let completed = false;
+
+    for (let attempt = 1; attempt <= maxAttemptsPerCycle; attempt += 1) {
+      const accountLock = await acquireAccountLock(account, config);
+      if (!accountLock.acquired) {
+        const previousPrefix = LOG_PREFIX;
+        setLogPrefix(account.name);
+        log(`Skipping account because another process is already handling it (${path.basename(accountLock.lockPath)})`);
+        setLogPrefix(previousPrefix);
+        break;
+      }
+
+      try {
+        if (attempt > 1) {
+          const previousPrefix = LOG_PREFIX;
+          setLogPrefix(account.name);
+          log(`Starting retry attempt ${attempt}/${maxAttemptsPerCycle}`);
+          setLogPrefix(previousPrefix);
+        }
+        await runAccountCycle(account, config);
+        log(`Cycle finished for ${account.name}`);
+        completed = true;
+        break;
+      } catch (error) {
+        const previousPrefix = LOG_PREFIX;
+        setLogPrefix(account.name);
+        log(`Account cycle failed on attempt ${attempt}/${maxAttemptsPerCycle}: ${error.message}`);
+        setLogPrefix(previousPrefix);
+      } finally {
+        await accountLock.release();
+      }
+
+      if (!retryOnFailure || attempt >= maxAttemptsPerCycle) {
+        break;
+      }
+
       const previousPrefix = LOG_PREFIX;
       setLogPrefix(account.name);
-      log(`Skipping account because another process is already handling it (${path.basename(accountLock.lockPath)})`);
+      log(`Retrying in ${formatDurationMinutes(retryDelayMs)}`);
       setLogPrefix(previousPrefix);
-      continue;
+      await sleep(retryDelayMs);
     }
-    try {
-      await runAccountCycle(account, config);
-      log(`Cycle finished for ${account.name}`);
-    } catch (error) {
+
+    if (!completed && retryOnFailure && maxAttemptsPerCycle > 1) {
       const previousPrefix = LOG_PREFIX;
       setLogPrefix(account.name);
-      log(`Account cycle failed: ${error.message}`);
+      log("Account cycle finished without success after retry attempts");
       setLogPrefix(previousPrefix);
-    } finally {
-      await accountLock.release();
     }
 
     if (index < accounts.length - 1 && config.execution.accountDelayMs > 0) {

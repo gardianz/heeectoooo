@@ -129,6 +129,9 @@ Contoh default:
     "browserChannel": "chrome",
     "accountDelayMs": 5000,
     "accountLockTtlMs": 21600000,
+    "retryOnFailure": true,
+    "retryDelayMs": 900000,
+    "maxAttemptsPerCycle": 2,
     "unlockAfterLock": false,
     "unlockAllOnly": false
   },
@@ -158,6 +161,9 @@ Penjelasan:
 - `execution.browserChannel`: default `chrome`
 - `execution.accountDelayMs`: delay antar akun
 - `execution.accountLockTtlMs`: masa berlaku lockfile per akun sebelum dianggap stale
+- `execution.retryOnFailure`: kalau `true`, bot akan mencoba lagi jika attempt pertama gagal
+- `execution.retryDelayMs`: jeda sebelum attempt kedua, default `900000` ms = 15 menit
+- `execution.maxAttemptsPerCycle`: total attempt per akun dalam satu cycle, default `2`
 - `execution.unlockAfterLock`: mode test, lock lalu unlock lagi
 - `execution.unlockAllOnly`: hanya unlock semua, tanpa lock baru
 - `locking.minAmount`: batas minimum lock, jangan isi di bawah `5000`
@@ -229,6 +235,22 @@ Mode ini akan standby dan hanya menjalankan cycle pada:
 - `Jumat`
 
 Sabtu dan Minggu tidak akan jalan.
+
+Kalau attempt pertama suatu akun gagal, bot akan:
+
+1. log error attempt pertama
+2. menunggu `15 menit`
+3. mencoba lagi `1 kali`
+
+Perilaku ini bisa diatur lewat:
+
+```json
+"execution": {
+  "retryOnFailure": true,
+  "retryDelayMs": 900000,
+  "maxAttemptsPerCycle": 2
+}
+```
 
 ### Jalankan sekali sekarang
 
