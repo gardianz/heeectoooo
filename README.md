@@ -36,6 +36,7 @@ Sumber state yang dipakai:
 
 - unlocked balance: `api.supanova.app/canton/api/balances`
 - active lock per company: `/api/locks?userPartyId=...`
+- best company by `1D`: gabungan `/api/allocator/companies` + `/api/prices/latest`
 
 ## Requirement
 

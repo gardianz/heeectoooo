@@ -517,16 +517,43 @@ async function fetchJson(page, url) {
 }
 
 function mapAllocateRow(row) {
+  const allocatorPerformancePct = Number(row.performancePct ?? 0);
   return {
     companyId: row.companyId,
     company: row.companyName,
     totalLocked: row.totalLocked,
-    performancePct: Number(row.performancePct ?? 0),
-    change: `${((Number(row.performancePct ?? 0)) * 100).toFixed(2)}%`,
+    performancePct: allocatorPerformancePct,
+    change: `${(allocatorPerformancePct * 100).toFixed(2)}%`,
     youLockedValue: Number(row.userLocked ?? 0),
     youLocked: String(row.userLocked ?? 0),
-    changeValue: Number(row.performancePct ?? 0),
+    changeValue: allocatorPerformancePct * 100,
+    allocatorPerformancePct,
   };
+}
+
+function mergeBestCompanyData(rows, companies, prices) {
+  const companyNameById = new Map(
+    (Array.isArray(companies) ? companies : [])
+      .filter((item) => item?.id)
+      .map((item) => [String(item.id), String(item.name ?? item.id)]),
+  );
+  const priceMap = prices && typeof prices === "object" ? prices : {};
+
+  return rows.map((row) => {
+    const companyId = String(row.companyId ?? "");
+    const latestPrice = priceMap[companyId];
+    const latestChangePct = Number(latestPrice?.changePct);
+    const hasLatestChange = Number.isFinite(latestChangePct);
+
+    return {
+      ...row,
+      company: companyNameById.get(companyId) ?? row.company,
+      performancePct: hasLatestChange ? latestChangePct / 100 : row.performancePct,
+      changeValue: hasLatestChange ? latestChangePct : row.changeValue,
+      change: hasLatestChange ? `${latestChangePct.toFixed(2)}%` : row.change,
+      latestPrice: Number.isFinite(Number(latestPrice?.price)) ? Number(latestPrice.price) : null,
+    };
+  });
 }
 
 function summarizeActiveLocks(locks, rows) {
@@ -568,16 +595,24 @@ async function fetchAllocateState(page) {
 
   const partyId = meResult.json.user.partyId;
   const tableResult = await fetchJson(page, "/api/allocator/table");
+  const companiesResult = await fetchJson(page, "/api/allocator/companies");
+  const pricesResult = await fetchJson(page, "/api/prices/latest");
   const locksResult = await fetchJson(page, `/api/locks?userPartyId=${encodeURIComponent(partyId)}`);
 
   if (!tableResult.ok || !Array.isArray(tableResult.json?.rows)) {
     throw new Error(`Failed to read allocator table: ${tableResult.status}`);
   }
+  if (!companiesResult.ok || !Array.isArray(companiesResult.json)) {
+    throw new Error(`Failed to read allocator companies: ${companiesResult.status}`);
+  }
+  if (!pricesResult.ok || !pricesResult.json?.prices || typeof pricesResult.json.prices !== "object") {
+    throw new Error(`Failed to read latest prices: ${pricesResult.status}`);
+  }
   if (!locksResult.ok || !Array.isArray(locksResult.json?.locks)) {
     throw new Error(`Failed to read locks state: ${locksResult.status}`);
   }
 
-  const rows = tableResult.json.rows.map(mapAllocateRow);
+  const rows = mergeBestCompanyData(tableResult.json.rows.map(mapAllocateRow), companiesResult.json, pricesResult.json.prices);
   const activeLockedCompanies = summarizeActiveLocks(locksResult.json.locks, rows);
 
   return {
@@ -602,7 +637,7 @@ async function ensureAllocateUiReady(page) {
 }
 
 function chooseBestCompany(rows) {
-  return [...rows].sort((left, right) => right.performancePct - left.performancePct)[0] ?? null;
+  return [...rows].sort((left, right) => right.changeValue - left.changeValue)[0] ?? null;
 }
 
 function chooseCurrentCompanies(rows) {
