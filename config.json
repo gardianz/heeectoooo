@@ -1,21 +1,29 @@
 {
   "timezone": "Asia/Jakarta",
   "schedule": {
-    "enabled": true,
+    "enabled": false,
     "hour": 4,
     "minute": 30,
     "weekdays": ["monday", "tuesday", "wednesday", "thursday", "friday"],
     "pollIntervalMs": 30000,
-    "runOnStart": false,
+    "runOnStart": true,
     "dedupeAcrossRestarts": true
   },
   "execution": {
     "headless": false,
     "execute": true,
+    "dashboard": true,
     "closeBrowser": true,
     "browserChannel": "chrome",
+    "maxConcurrentAccounts": 0,
+    "parallelStartGapMs": 4000,
     "accountDelayMs": 5000,
     "accountLockTtlMs": 21600000,
+    "actionDelayMinMs": 250,
+    "actionDelayMaxMs": 900,
+    "typingDelayMs": 65,
+    "otpMaxAttempts": 3,
+    "otpVerificationTimeoutMs": 20000,
     "unlockAfterLock": false,
     "unlockAllOnly": false
   },
