@@ -697,6 +697,38 @@ function getTypingDelay() {
   return Math.max(20, Number(getExecutionSetting("typingDelayMs", 65)));
 }
 
+function getExecutionDelayMs(key, fallbackValue) {
+  const value = Number(getExecutionSetting(key, fallbackValue));
+  if (!Number.isFinite(value) || value <= 0) {
+    return 0;
+  }
+  return Math.max(0, Math.round(value));
+}
+
+function formatDelaySeconds(ms) {
+  const seconds = Number(ms ?? 0) / 1000;
+  return `${seconds % 1 === 0 ? seconds.toFixed(0) : seconds.toFixed(1)}s`;
+}
+
+async function waitForConfiguredDelay(key, fallbackValue, label = "") {
+  const duration = getExecutionDelayMs(key, fallbackValue);
+  if (duration <= 0) {
+    return;
+  }
+  if (label) {
+    log(`${label} (${formatDelaySeconds(duration)})`);
+  }
+  await sleep(duration);
+}
+
+async function pauseBeforeSignature(label = "Signature prompt ready, pausing before submit") {
+  await waitForConfiguredDelay("signClickDelayMs", 1_800, label);
+}
+
+async function pauseAfterSignature(label = "Signature submitted, waiting for Hecto to settle") {
+  await waitForConfiguredDelay("postSignSettleMs", 4_500, label);
+}
+
 async function clickLocator(locator, options = {}) {
   const { timeout = 10_000, delayMultiplier = 1 } = options;
   await locator.waitFor({ state: "visible", timeout }).catch(() => {});
@@ -749,6 +781,10 @@ function defaultConfig() {
       typingDelayMs: 65,
       otpMaxAttempts: 3,
       otpVerificationTimeoutMs: 20_000,
+      signClickDelayMs: 1_800,
+      postSignSettleMs: 4_500,
+      allocateStateStabilizeAttempts: 4,
+      allocateStateStabilizeDelayMs: 2_500,
     },
     locking: {
       minAmount: 5_000,
@@ -803,7 +839,18 @@ function normalizeAccount(account, index, config) {
 async function loadAccounts(config) {
   const accountsFile = await readJsonFileIfExists(ACCOUNTS_PATH);
   if (Array.isArray(accountsFile) && accountsFile.length) {
-    return accountsFile.map((account, index) => normalizeAccount(account, index, config)).filter((account) => account.enabled);
+    let accounts = accountsFile.map((account, index) => normalizeAccount(account, index, config)).filter((account) => account.enabled);
+    const onlyAccount = String(process.env.HECTO_ONLY_ACCOUNT ?? "").trim().toLowerCase();
+    if (onlyAccount) {
+      accounts = accounts.filter((account) => {
+        return (
+          String(account.name ?? "").trim().toLowerCase() === onlyAccount ||
+          String(account.profileName ?? "").trim().toLowerCase() === onlyAccount ||
+          String(account.email ?? "").trim().toLowerCase() === onlyAccount
+        );
+      });
+    }
+    return accounts;
   }
 
   return [
@@ -861,6 +908,41 @@ async function getOtpCheckpoint(email, appPassword, earliestTime = Date.now()) {
   }).catch(() => ({ lastUid: 0 }));
 }
 
+function extractPrivyOtpCode(sourceText) {
+  const normalized = String(sourceText ?? "")
+    .replace(/=\r?\n/g, "")
+    .replace(/=3D/gi, "=")
+    .replace(/\u200b/g, "")
+    .replace(/\r/g, "\n");
+
+  const prioritizedPatterns = [
+    /your code is[^0-9]{0,80}(\d{6})/i,
+    /login code[^0-9]{0,80}(\d{6})/i,
+    /confirmation code[^0-9]{0,80}(\d{6})/i,
+    /enter your code[^0-9]{0,80}(\d{6})/i,
+  ];
+
+  for (const pattern of prioritizedPatterns) {
+    const match = normalized.match(pattern);
+    if (match?.[1]) {
+      return match[1];
+    }
+  }
+
+  const matches = [...normalized.matchAll(/\b(\d{6})\b/g)].map((match) => match[1]);
+  if (!matches.length) {
+    return "";
+  }
+
+  const frequency = new Map();
+  for (const code of matches) {
+    frequency.set(code, (frequency.get(code) ?? 0) + 1);
+  }
+
+  const repeatedMatches = matches.filter((code) => (frequency.get(code) ?? 0) > 1);
+  return repeatedMatches.at(-1) ?? matches.at(-1) ?? "";
+}
+
 async function waitForOtp(email, appPassword, options = {}) {
   const earliestTime = Number(options.earliestTime ?? Date.now());
   const minUid = Math.max(0, Number(options.minUid ?? 0));
@@ -902,9 +984,9 @@ async function waitForOtp(email, appPassword, options = {}) {
           continue;
         }
 
-        const match = haystack.match(/\b(\d{6})\b/);
-        if (match && !usedCodes.has(match[1])) {
-          return match[1];
+        const code = extractPrivyOtpCode(haystack);
+        if (code && !usedCodes.has(code)) {
+          return code;
         }
       }
 
@@ -925,23 +1007,49 @@ async function fillOtpCode(page, otpCode) {
   const otpInputs = page.locator('input[inputmode="numeric"], input[autocomplete="one-time-code"]');
   const otpCount = await otpInputs.count();
   if (otpCount >= 6) {
-    const firstInput = otpInputs.first();
+    const visualOrder = await otpInputs
+      .evaluateAll((nodes) =>
+        nodes
+          .map((node, index) => {
+            const rect = node.getBoundingClientRect();
+            return {
+              index,
+              x: rect.x,
+              y: rect.y,
+              width: rect.width,
+              height: rect.height,
+            };
+          })
+          .filter((entry) => entry.width > 0 && entry.height > 0)
+          .sort((left, right) => (left.y - right.y) || (left.x - right.x))
+          .map((entry) => entry.index),
+      )
+      .catch(() => []);
+    const orderedIndices = visualOrder.length ? visualOrder : Array.from({ length: otpCount }, (_, index) => index);
+    const firstInput = otpInputs.nth(orderedIndices[0] ?? 0);
     await firstInput.waitFor({ state: "visible", timeout: 10_000 }).catch(() => {});
     await humanDelay(0.25);
     await firstInput.click();
     await humanDelay(0.15);
-    for (let index = 0; index < otpCount; index += 1) {
-      await otpInputs.nth(index).fill("").catch(() => {});
-    }
+    await otpInputs.evaluateAll((nodes) => {
+      const descriptor = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value");
+      for (const node of nodes) {
+        descriptor?.set?.call(node, "");
+        node.dispatchEvent(new Event("input", { bubbles: true }));
+        node.dispatchEvent(new Event("change", { bubbles: true }));
+      }
+    }).catch(() => {});
+    await humanDelay(0.1);
+    await firstInput.click().catch(() => {});
     await humanDelay(0.1);
     await page.keyboard.type(otpCode, { delay: getTypingDelay() });
     await humanDelay(0.4);
     const joinedValue = await otpInputs
-      .evaluateAll((nodes) => nodes.map((node) => String(node.value ?? "")).join(""))
+      .evaluateAll((nodes, indices) => indices.map((index) => String(nodes[index]?.value ?? "")).join(""), orderedIndices)
       .catch(() => "");
     if (joinedValue.slice(0, otpCode.length) !== otpCode) {
-      for (let index = 0; index < 6; index += 1) {
-        const input = otpInputs.nth(index);
+      for (let index = 0; index < Math.min(otpCode.length, orderedIndices.length); index += 1) {
+        const input = otpInputs.nth(orderedIndices[index]);
         await input.waitFor({ state: "visible", timeout: 10_000 }).catch(() => {});
         await humanDelay(0.2);
         await input.click().catch(() => {});
@@ -1092,6 +1200,7 @@ async function ensureLoggedIn(page, credentials) {
 
   if (authenticated) {
     log("Existing Hecto session is already active");
+    await waitForConfiguredDelay("allocateStateStabilizeDelayMs", 2_500, "Session is active, letting app state settle");
     return;
   }
 
@@ -1100,13 +1209,16 @@ async function ensureLoggedIn(page, credentials) {
     ((await isVisible(page, 'button:has-text("Sign")')) || (await isVisible(page, 'button:has-text("SIGN")')))
   ) {
     log("Detected direct wallet verification prompt on auth page");
+    await pauseBeforeSignature("Direct auth prompt ready, pausing before clicking Sign");
     if (await clickIfVisible(page, 'button:has-text("Sign")')) {
       log('Clicked "Sign" on direct auth challenge');
     } else {
       await clickIfVisible(page, 'button:has-text("SIGN")');
       log('Clicked "SIGN" on direct auth challenge');
     }
+    await pauseAfterSignature("Auth signature clicked, letting Privy/Hecto settle");
     await page.waitForURL((url) => !/\/auth(?:$|\?)/.test(url.toString()), { timeout: 90_000 });
+    await waitForConfiguredDelay("allocateStateStabilizeDelayMs", 2_500, "Dashboard opened, waiting for session data");
     log(`Dashboard session re-established at ${page.url()}`);
     return;
   }
@@ -1197,6 +1309,7 @@ async function ensureLoggedIn(page, credentials) {
     'text=/sign message/i',
   ], 90_000);
 
+  await pauseBeforeSignature("Sign message prompt ready, pausing before clicking Sign");
   if (await clickIfVisible(page, 'button:has-text("Sign")')) {
     log("Clicked Sign on message prompt");
   } else {
@@ -1204,7 +1317,9 @@ async function ensureLoggedIn(page, credentials) {
     log("Clicked SIGN on message prompt");
   }
 
+  await pauseAfterSignature("Auth signature clicked, letting Privy/Hecto settle");
   await page.waitForURL((url) => !/\/auth(?:$|\?)/.test(url.toString()), { timeout: 90_000 });
+  await waitForConfiguredDelay("allocateStateStabilizeDelayMs", 2_500, "Dashboard opened, waiting for session data");
   log(`Dashboard session established at ${page.url()}`);
 }
 
@@ -1269,8 +1384,8 @@ async function readAllocateUiState(page) {
 
     const hasUnlockButton = visibleButtons.some((text) => /^unlock\b/i.test(text));
     const hasEditButton = visibleButtons.some((text) => /^edit\b/i.test(text));
-    const isLockPending = /locking \$hecto/i.test(bodyText);
-    const isUnlockPending = /terminating lock/i.test(bodyText);
+    const isLockPending = /locking \$hecto|locking allocations/i.test(bodyText);
+    const isUnlockPending = /terminating lock|unlocking allocations|processing unlock/i.test(bodyText);
     const panelMode = /locking hecto/i.test(bodyText) ? "locking" : /your position/i.test(bodyText) ? "position" : "unknown";
     const definedLockMatch = bodyText.match(/your defined lock\s+([\d.,]+)\s+hecto/i);
     const lockingBalanceMatch = bodyText.match(/locking balance\s+([\d.,]+)\s+hecto/i);
@@ -1396,7 +1511,7 @@ async function inspectAllocateLockState(page, rows = []) {
 
   const contractLockedCompanies = summarizeLockControllerAllocations(rows, lockControllerContracts);
   const uiLockedCompanies = summarizeUiTableLocks(rows, uiState);
-  const activeLockedCompanies = contractLockedCompanies.length ? contractLockedCompanies : uiLockedCompanies;
+  const activeLockedCompanies = uiLockedCompanies.length ? uiLockedCompanies : contractLockedCompanies;
   const definedLockValue = Math.max(
     uiState?.definedLockValue ?? 0,
     uiState?.totalAllocatedValue ?? 0,
@@ -1556,7 +1671,10 @@ function nearlyEqual(left, right, epsilon = 0.0001) {
 }
 
 async function unlockCurrent(page, currentCompany = null, rows = []) {
-  let currentState = await inspectAllocateLockState(page, rows);
+  let currentState = await readStableAllocateState(page, rows, {
+    maxAttempts: 3,
+    retryDelayMs: getExecutionDelayMs("allocateStateStabilizeDelayMs", 2_500),
+  });
   const unlockLabel = currentCompany?.company || currentState.activeLockedCompanies[0]?.company || "current defined lock";
   const expectedAmount = Math.max(
     parseNumber(currentCompany?.youLockedValue ?? 0),
@@ -1617,7 +1735,15 @@ async function unlockCurrent(page, currentCompany = null, rows = []) {
       actionText: `Unlock step ${attempt}/3`,
     });
     log(`Attempting unlock for ${unlockLabel} (step ${attempt})`);
-    const clicked = await clickFirstVisibleUnlockButton(page);
+    let clicked = await clickFirstVisibleUnlockButton(page);
+    if (!clicked) {
+      log(`Unlock button is not visible yet for ${unlockLabel}; re-checking allocate UI`);
+      currentState = await readStableAllocateState(page, rows, {
+        maxAttempts: 2,
+        retryDelayMs: getExecutionDelayMs("allocateStateStabilizeDelayMs", 2_500),
+      });
+      clicked = await clickFirstVisibleUnlockButton(page);
+    }
     if (!clicked) {
       throw new Error(`Unable to click unlock button for ${unlockLabel}`);
     }
@@ -1642,26 +1768,35 @@ async function unlockCurrent(page, currentCompany = null, rows = []) {
   throw new Error(`Timed out waiting for ${unlockLabel} to fully unlock from allocate UI`);
 }
 
-async function readLockingBalance(page) {
+async function readHectoBalances(page) {
   try {
-    const responsePromise = page.waitForResponse((response) => {
-      return response.url().includes("api.supanova.app/canton/api/balances") && response.ok();
-    }, { timeout: 8_000 });
-    await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
-    await page.waitForLoadState("networkidle").catch(() => {});
-    const response = await responsePromise;
-    const text = await response.text();
-    const json = JSON.parse(text);
+    const response = await fetchJsonOrNull(page, "https://api.supanova.app/canton/api/balances");
+    const json = response?.ok ? response.json : null;
     if (json && Array.isArray(json.tokens)) {
       const hectoToken = json.tokens.find((token) => {
         return String(token?.instrumentId?.id ?? "").toUpperCase() === "HECTO";
       });
       if (hectoToken) {
-        return parseNumber(hectoToken.totalUnlockedBalance ?? 0);
+        const unlockedBalance = parseNumber(hectoToken.totalUnlockedBalance ?? hectoToken.unlockedBalance ?? 0);
+        const lockedBalance = Math.max(
+          parseNumber(hectoToken.totalLockedBalance ?? 0),
+          parseNumber(hectoToken.lockedBalance ?? 0),
+          parseNumber(hectoToken.totalAllocatedBalance ?? 0),
+        );
+        const totalBalance = Math.max(
+          parseNumber(hectoToken.totalBalance ?? 0),
+          unlockedBalance + lockedBalance,
+        );
+        return {
+          unlockedBalance,
+          lockedBalance,
+          totalBalance,
+          source: "balances-api",
+        };
       }
     }
   } catch {
-    // Fall back to visible allocate text if the balance poll is not observed in time.
+    // Fall back to visible allocate text if the balances API is not available in time.
   }
 
   const result = await page.evaluate(() => {
@@ -1669,8 +1804,111 @@ async function readLockingBalance(page) {
     return normalize(document.body?.innerText ?? "");
   });
 
-  const match = String(result ?? "").match(/balance\s+([\d.,]+)\s+hecto/i);
-  return match ? parseNumber(match[1]) : 0;
+  const bodyText = String(result ?? "");
+  const unlockedMatch = bodyText.match(/locking balance\s+([\d.,]+)\s+hecto/i);
+  const definedLockMatch = bodyText.match(/your defined lock\s+([\d.,]+)\s+hecto/i);
+  const totalAllocatedMatch = bodyText.match(/total allocated\s+([\d.,]+)\s+hecto/i);
+  const unlockedBalance = unlockedMatch ? parseNumber(unlockedMatch[1]) : 0;
+  const lockedBalance = Math.max(
+    definedLockMatch ? parseNumber(definedLockMatch[1]) : 0,
+    totalAllocatedMatch ? parseNumber(totalAllocatedMatch[1]) : 0,
+  );
+
+  return {
+    unlockedBalance,
+    lockedBalance,
+    totalBalance: unlockedBalance + lockedBalance,
+    source: "allocate-dom",
+  };
+}
+
+async function readLockingBalance(page) {
+  const balances = await readHectoBalances(page);
+  return parseNumber(balances.unlockedBalance ?? 0);
+}
+
+async function readStableAllocateState(page, rows = [], options = {}) {
+  const maxAttempts = Math.max(
+    1,
+    Number.parseInt(String(options.maxAttempts ?? getExecutionSetting("allocateStateStabilizeAttempts", 4)), 10) || 1,
+  );
+  const retryDelayMs = Math.max(
+    250,
+    Number.parseInt(String(options.retryDelayMs ?? getExecutionSetting("allocateStateStabilizeDelayMs", 2_500)), 10) || 2_500,
+  );
+  const reloadBetweenAttempts = options.reloadBetweenAttempts !== false;
+  let lastSnapshot = null;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    const [state, balances] = await Promise.all([
+      inspectAllocateLockState(page, rows),
+      readHectoBalances(page).catch(() => ({ unlockedBalance: 0, lockedBalance: 0, totalBalance: 0, source: "error" })),
+    ]);
+    const activeLockedAmount = (state.activeLockedCompanies ?? []).reduce(
+      (total, row) => total + parseNumber(row?.youLockedValue ?? 0),
+      0,
+    );
+    const lockedBalance = Math.max(
+      parseNumber(balances.lockedBalance ?? 0),
+      parseNumber(state.definedLockValue ?? 0),
+      parseNumber(state.uiState?.totalAllocatedValue ?? 0),
+      activeLockedAmount,
+    );
+    const unlockedBalance = Math.max(
+      parseNumber(balances.unlockedBalance ?? 0),
+      parseNumber(state.uiState?.lockingBalanceValue ?? 0),
+    );
+    const snapshot = {
+      ...state,
+      definedLockValue: Math.max(parseNumber(state.definedLockValue ?? 0), lockedBalance),
+      hasCurrentDefinedLock: Boolean(state.hasCurrentDefinedLock) || lockedBalance > 0,
+      balanceSnapshot: {
+        ...balances,
+        unlockedBalance,
+        lockedBalance,
+        totalBalance: Math.max(parseNumber(balances.totalBalance ?? 0), unlockedBalance + lockedBalance),
+      },
+    };
+    const panelMode = snapshot.uiState?.panelMode ?? "unknown";
+    const missingVisibleLockControls =
+      lockedBalance > 0 && !snapshot.uiState?.hasUnlockButton && panelMode !== "position";
+    const unresolvedEmptyState =
+      unlockedBalance <= 0 &&
+      lockedBalance <= 0 &&
+      !snapshot.hasCurrentDefinedLock &&
+      panelMode !== "locking";
+
+    lastSnapshot = snapshot;
+    if (!missingVisibleLockControls && !unresolvedEmptyState) {
+      return snapshot;
+    }
+
+    if (attempt < maxAttempts) {
+      log(
+        `Allocate state still settling (attempt ${attempt}/${maxAttempts}): panel=${panelMode} unlocked=${unlockedBalance} locked=${lockedBalance}`,
+      );
+      await page.waitForTimeout(retryDelayMs);
+      if (reloadBetweenAttempts) {
+        await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+        await page.waitForLoadState("networkidle").catch(() => {});
+      }
+      await ensureAllocateUiReady(page);
+    }
+  }
+
+  return lastSnapshot ?? {
+    uiState: null,
+    lockControllerContracts: [],
+    activeLockedCompanies: [],
+    definedLockValue: 0,
+    hasCurrentDefinedLock: false,
+    balanceSnapshot: {
+      unlockedBalance: 0,
+      lockedBalance: 0,
+      totalBalance: 0,
+      source: "fallback",
+    },
+  };
 }
 
 async function waitForLockingBalance(page, minimum, timeout = 120_000) {
@@ -1719,10 +1957,14 @@ async function waitForUnlockTransition(page, rows = [], previousState = null, ex
     await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
     await page.waitForLoadState("networkidle").catch(() => {});
 
-    const state = await inspectAllocateLockState(page, rows);
+    const state = await readStableAllocateState(page, rows, {
+      maxAttempts: 2,
+      retryDelayMs: getExecutionDelayMs("allocateStateStabilizeDelayMs", 2_500),
+      reloadBetweenAttempts: false,
+    });
     const lockingBalance = Math.max(
       parseNumber(state.uiState?.lockingBalanceValue ?? 0),
-      await readLockingBalance(page),
+      parseNumber(state.balanceSnapshot?.unlockedBalance ?? 0),
     );
     const signature = describeLockState(state);
     log(
@@ -1751,7 +1993,11 @@ async function waitForUnlockTransition(page, rows = [], previousState = null, ex
   }
 
   return {
-    state: await inspectAllocateLockState(page, rows),
+    state: await readStableAllocateState(page, rows, {
+      maxAttempts: 2,
+      retryDelayMs: getExecutionDelayMs("allocateStateStabilizeDelayMs", 2_500),
+      reloadBetweenAttempts: false,
+    }),
     unlocked: false,
     lockingBalance: 0,
   };
@@ -1768,7 +2014,11 @@ async function waitForTargetLocked(page, targetCompany, minimumAmount, rows = []
     await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
     await page.waitForLoadState("networkidle").catch(() => {});
 
-    const state = await inspectAllocateLockState(page, rows);
+    const state = await readStableAllocateState(page, rows, {
+      maxAttempts: 2,
+      retryDelayMs: getExecutionDelayMs("allocateStateStabilizeDelayMs", 2_500),
+      reloadBetweenAttempts: false,
+    });
     const refreshedTarget =
       state.activeLockedCompanies.find((row) => row.companyId === targetCompany.companyId) ??
       null;
@@ -1847,16 +2097,26 @@ async function confirmTransaction(page) {
   while (Date.now() - started < 90_000) {
     const pages = page.context().pages();
     for (const candidate of pages) {
+      const signAndSendVisible = await isVisible(candidate, 'button:has-text("Sign & Send")');
+      const signVisible = signAndSendVisible || (await isVisible(candidate, 'button:has-text("Sign")'));
+      const signUpperVisible = signVisible || (await isVisible(candidate, 'button:has-text("SIGN")'));
+
+      if (signAndSendVisible || signVisible || signUpperVisible) {
+        await pauseBeforeSignature("Signature modal ready, pausing before clicking submit");
+      }
       if (await clickIfVisible(candidate, 'button:has-text("Sign & Send")')) {
         log(`Clicked "Sign & Send" on ${candidate.url() || "popup"}`);
+        await pauseAfterSignature();
         return;
       }
       if (await clickIfVisible(candidate, 'button:has-text("Sign")')) {
         log(`Clicked "Sign" on ${candidate.url() || "popup"}`);
+        await pauseAfterSignature();
         return;
       }
       if (await clickIfVisible(candidate, 'button:has-text("SIGN")')) {
         log(`Clicked "SIGN" on ${candidate.url() || "popup"}`);
+        await pauseAfterSignature();
         return;
       }
     }
@@ -2387,6 +2647,36 @@ async function releaseAccountLock(lockPath) {
   }
 }
 
+async function readAccountLockMetadata(lockPath) {
+  try {
+    const text = await fs.readFile(lockPath, "utf8");
+    const parsed = JSON.parse(text);
+    return parsed && typeof parsed === "object" ? parsed : null;
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return null;
+    }
+    return null;
+  }
+}
+
+function isProcessAlive(pid) {
+  const numericPid = Number.parseInt(String(pid ?? ""), 10);
+  if (!Number.isInteger(numericPid) || numericPid <= 0) {
+    return false;
+  }
+
+  try {
+    process.kill(numericPid, 0);
+    return true;
+  } catch (error) {
+    if (error?.code === "EPERM") {
+      return true;
+    }
+    return false;
+  }
+}
+
 async function acquireAccountLock(account, config) {
   const lockPath = getAccountLockPath(account);
   const ttlMs = Math.max(60_000, Number(config.execution.accountLockTtlMs ?? 6 * 60 * 60 * 1000));
@@ -2415,6 +2705,13 @@ async function acquireAccountLock(account, config) {
       }
 
       try {
+        const metadata = await readAccountLockMetadata(lockPath);
+        if (metadata?.pid && !isProcessAlive(metadata.pid)) {
+          log(`Removing abandoned account lock for ${account.name} (pid ${metadata.pid} is no longer running)`);
+          await releaseAccountLock(lockPath);
+          continue;
+        }
+
         const stat = await fs.stat(lockPath);
         const ageMs = Date.now() - stat.mtimeMs;
         if (ageMs > ttlMs) {
@@ -2514,14 +2811,15 @@ async function runAccountCycle(account, config) {
       throw new Error("Allocator API returned no rows");
     }
     await ensureAllocateUiReady(page);
-    const currentLockState = await inspectAllocateLockState(page, rows);
-    const unlockedBalance = await readLockingBalance(page);
+    const currentLockState = await readStableAllocateState(page, rows);
+    const unlockedBalance = parseNumber(currentLockState.balanceSnapshot?.unlockedBalance ?? 0);
+    const lockedBalance = parseNumber(currentLockState.balanceSnapshot?.lockedBalance ?? 0);
 
     log(`Allocator API rows found: ${rows.length}`);
     for (const row of rows) {
       log(`row -> company=${row.company} 1D=${row.change} youLocked=${row.youLocked} totalLocked=${row.totalLocked}`);
     }
-    log(`HECTO unlocked balance=${unlockedBalance}`);
+    log(`HECTO balances unlocked=${unlockedBalance} locked=${lockedBalance}`);
 
     const bestCompany = chooseBestCompany(rows);
     let currentCompanies = currentLockState.activeLockedCompanies;
@@ -2610,7 +2908,16 @@ async function runAccountCycle(account, config) {
         log("No active defined lock needs to be cleared before locking");
       }
 
-      const refreshedUnlockedBalance = await readLockingBalance(page);
+      const refreshedAllocateState = await readStableAllocateState(page, rows, {
+        maxAttempts: 2,
+        retryDelayMs: getExecutionDelayMs("allocateStateStabilizeDelayMs", 2_500),
+        reloadBetweenAttempts: false,
+      });
+      const refreshedBalanceSnapshot = refreshedAllocateState.balanceSnapshot ?? (await readHectoBalances(page));
+      const refreshedUnlockedBalance = Math.max(
+        parseNumber(refreshedBalanceSnapshot.unlockedBalance ?? 0),
+        parseNumber(refreshedAllocateState.uiState?.lockingBalanceValue ?? 0),
+      );
       const targetAmount = resolveLockTarget(refreshedUnlockedBalance, account.locking);
       const minimum = Math.max(5_000, parseNumber(account.locking.minAmount ?? 5_000));
       updateDashboardAccount(account.name, {
@@ -2920,6 +3227,24 @@ async function main() {
   }
   if (process.env.HECTO_TYPING_DELAY_MS?.trim()) {
     config.execution.typingDelayMs = Number.parseInt(process.env.HECTO_TYPING_DELAY_MS.trim(), 10);
+  }
+  if (process.env.HECTO_SIGN_CLICK_DELAY_MS?.trim()) {
+    config.execution.signClickDelayMs = Number.parseInt(process.env.HECTO_SIGN_CLICK_DELAY_MS.trim(), 10);
+  }
+  if (process.env.HECTO_POST_SIGN_SETTLE_MS?.trim()) {
+    config.execution.postSignSettleMs = Number.parseInt(process.env.HECTO_POST_SIGN_SETTLE_MS.trim(), 10);
+  }
+  if (process.env.HECTO_ALLOCATE_STABILIZE_ATTEMPTS?.trim()) {
+    config.execution.allocateStateStabilizeAttempts = Number.parseInt(
+      process.env.HECTO_ALLOCATE_STABILIZE_ATTEMPTS.trim(),
+      10,
+    );
+  }
+  if (process.env.HECTO_ALLOCATE_STABILIZE_DELAY_MS?.trim()) {
+    config.execution.allocateStateStabilizeDelayMs = Number.parseInt(
+      process.env.HECTO_ALLOCATE_STABILIZE_DELAY_MS.trim(),
+      10,
+    );
   }
   if (process.env.HECTO_OTP_MAX_ATTEMPTS?.trim()) {
     config.execution.otpMaxAttempts = Number.parseInt(process.env.HECTO_OTP_MAX_ATTEMPTS.trim(), 10);
